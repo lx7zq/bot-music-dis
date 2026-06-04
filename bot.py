@@ -6,8 +6,13 @@ import os
 from collections import deque
 
 # ==========================================
-# ตั้งค่า Bot Token ของคุณที่นี่
+# Debug PyNaCl
 # ==========================================
+try:
+    import nacl
+    print(f"✅ PyNaCl version: {nacl.__version__}")
+except ImportError:
+    print("❌ PyNaCl ไม่ได้ติดตั้ง!")
 
 TOKEN = os.environ.get("TOKEN")
 
@@ -21,11 +26,6 @@ YDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "postprocessors": [{
-        "key": "FFmpegExtractAudio",
-        "preferredcodec": "mp3",
-        "preferredquality": "192",
-    }],
 }
 
 FFMPEG_OPTIONS = {
@@ -42,7 +42,6 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# เก็บ queue แยกตาม guild
 queues: dict[int, deque] = {}
 now_playing: dict[int, dict] = {}
 
@@ -65,7 +64,6 @@ async def search_and_get_info(query: str) -> list[dict]:
 
     def _search():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # ถ้าไม่ใช่ URL ให้ค้นหา
             if not query.startswith("http"):
                 info = ydl.extract_info(f"ytsearch:{query}", download=False)
                 if info and "entries" in info and info["entries"]:
@@ -85,10 +83,14 @@ def play_next(ctx):
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
 
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        return
+
     if queue:
         song = queue.popleft()
         now_playing[guild_id] = song
 
+        # ใช้ url โดยตรง ไม่ต้อง postprocess
         source = discord.FFmpegPCMAudio(song["url"], **FFMPEG_OPTIONS)
         ctx.voice_client.play(
             source,
@@ -101,7 +103,6 @@ def play_next(ctx):
 
 
 async def send_now_playing(ctx, error=None):
-    """ส่งข้อความแสดงเพลงที่กำลังเล่น"""
     if error:
         print(f"Player error: {error}")
     play_next(ctx)
@@ -125,7 +126,6 @@ async def on_ready():
 
 @bot.command(name="join", aliases=["เข้ามา", "j"])
 async def join(ctx):
-    """เข้าร่วม Voice Channel"""
     if not ctx.author.voice:
         return await ctx.send("❌ คุณต้องอยู่ใน Voice Channel ก่อน!")
 
@@ -134,25 +134,29 @@ async def join(ctx):
     if ctx.voice_client:
         await ctx.voice_client.move_to(channel)
     else:
-        await channel.connect()
+        # reconnect=True แก้ปัญหา 4006
+        await channel.connect(reconnect=True)
 
     await ctx.send(f"✅ เข้าร่วม **{channel.name}** แล้ว!")
 
 
 @bot.command(name="play", aliases=["p", "เล่น"])
 async def play(ctx, *, query: str):
-    """เล่นเพลงจาก YouTube"""
     if not ctx.author.voice:
         return await ctx.send("❌ คุณต้องอยู่ใน Voice Channel ก่อน!")
 
-    # เข้า voice channel ถ้ายังไม่ได้อยู่
     if not ctx.voice_client:
-        await ctx.author.voice.channel.connect()
+        # reconnect=True แก้ปัญหา 4006
+        await ctx.author.voice.channel.connect(reconnect=True)
 
     async with ctx.typing():
         msg = await ctx.send(f"🔍 กำลังค้นหา **{query}**...")
 
-        songs = await search_and_get_info(query)
+        try:
+            songs = await search_and_get_info(query)
+        except Exception as e:
+            print(f"Search error: {e}")
+            return await msg.edit(content=f"❌ เกิดข้อผิดพลาด: {e}")
 
         if not songs:
             return await msg.edit(content="❌ ไม่พบเพลงที่ค้นหา")
@@ -179,7 +183,6 @@ async def play(ctx, *, query: str):
                 content=f"✅ เพิ่ม **{title}** ({mins}:{secs:02d}) เข้า Queue แล้ว!"
             )
 
-    # เริ่มเล่นถ้าไม่มีเพลงกำลังเล่นอยู่
     if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
         play_next(ctx)
         if ctx.guild.id in now_playing:
@@ -200,7 +203,6 @@ async def play(ctx, *, query: str):
 
 @bot.command(name="pause", aliases=["หยุด"])
 async def pause(ctx):
-    """หยุดชั่วคราว"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.send("⏸ หยุดชั่วคราวแล้ว")
@@ -210,7 +212,6 @@ async def pause(ctx):
 
 @bot.command(name="resume", aliases=["เล่นต่อ"])
 async def resume(ctx):
-    """เล่นต่อ"""
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.send("▶️ เล่นต่อแล้ว")
@@ -220,7 +221,6 @@ async def resume(ctx):
 
 @bot.command(name="skip", aliases=["s", "ข้าม"])
 async def skip(ctx):
-    """ข้ามเพลง"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
         await ctx.send("⏭ ข้ามเพลงแล้ว")
@@ -230,7 +230,6 @@ async def skip(ctx):
 
 @bot.command(name="stop", aliases=["หยุดเลย"])
 async def stop(ctx):
-    """หยุดเล่นและล้าง Queue"""
     guild_id = ctx.guild.id
     queues[guild_id] = deque()
     now_playing.pop(guild_id, None)
@@ -243,13 +242,11 @@ async def stop(ctx):
 
 @bot.command(name="queue", aliases=["q", "คิว"])
 async def show_queue(ctx):
-    """แสดง Queue เพลง"""
     queue = get_queue(ctx.guild.id)
     guild_id = ctx.guild.id
 
     embed = discord.Embed(title="🎶 Queue เพลง", color=0x5865F2)
 
-    # เพลงที่กำลังเล่น
     if guild_id in now_playing:
         song = now_playing[guild_id]
         embed.add_field(
@@ -277,7 +274,6 @@ async def show_queue(ctx):
 
 @bot.command(name="nowplaying", aliases=["np", "กำลังเล่น"])
 async def now_playing_cmd(ctx):
-    """แสดงเพลงที่กำลังเล่น"""
     guild_id = ctx.guild.id
 
     if guild_id not in now_playing:
@@ -297,14 +293,12 @@ async def now_playing_cmd(ctx):
 
 @bot.command(name="clear", aliases=["ล้างคิว"])
 async def clear_queue(ctx):
-    """ล้าง Queue"""
     queues[ctx.guild.id] = deque()
     await ctx.send("🗑 ล้าง Queue แล้ว")
 
 
 @bot.command(name="leave", aliases=["ออก", "dc"])
 async def leave(ctx):
-    """ออกจาก Voice Channel"""
     if ctx.voice_client:
         queues.pop(ctx.guild.id, None)
         now_playing.pop(ctx.guild.id, None)
@@ -316,7 +310,6 @@ async def leave(ctx):
 
 @bot.command(name="volume", aliases=["vol", "เสียง"])
 async def volume(ctx, vol: int):
-    """ปรับระดับเสียง (0-100)"""
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         return await ctx.send("❌ ไม่มีเพลงกำลังเล่นอยู่")
 
